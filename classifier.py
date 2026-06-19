@@ -55,7 +55,32 @@ def build_few_shot_prompt(labeled_examples: list[dict], description: str) -> str
 
     Before writing code, complete specs/classifier-spec.md.
     """
-    return ""
+    task_instruction = """You are classifying podcast episodes by their format. Classify the episode into exactly one of these four labels:
+
+- interview: a conversation between a host and one or more guests
+- solo: a single host speaking from memory, experience, or opinion — no guests, no assembled external sources
+- panel: multiple guests with roughly equal speaking time, often debating or discussing a topic together
+- narrative: a story assembled from external sources — interviews, archival audio, reporting — with a clear narrative arc
+
+Return only the label and your reasoning. Do not explain the taxonomy."""
+
+    # Build training examples section
+    examples_section = ""
+    if labeled_examples:
+        examples_section = "\n\n--- TRAINING EXAMPLES ---\n"
+        for example in labeled_examples:
+            examples_section += f"\nTitle: {example['title']}\nDescription: {example['description']}\nLabel: {example['label']}\n"
+            examples_section += "---"
+    else:
+        examples_section = "\n\n(No training examples provided; classify based on task instructions above.)\n"
+
+    # Build the new episode section
+    new_episode = f"\n\n--- EPISODE TO CLASSIFY ---\n\nTitle: [Unknown]\nDescription: {description}\nLabel: ?\n"
+
+    # Build the output instruction
+    output_instruction = "\nClassify the episode above. Return your answer in the format below:\n\nLabel: <label>\nReasoning: <brief explanation>"
+
+    return task_instruction + examples_section + new_episode + output_instruction
 
 
 def classify_episode(description: str, labeled_examples: list[dict]) -> dict:
@@ -76,7 +101,42 @@ def classify_episode(description: str, labeled_examples: list[dict]) -> dict:
 
     Before writing code, complete specs/classifier-spec.md.
     """
-    return {
-        "label": None,
-        "reasoning": "Classifier not yet implemented. Complete Milestone 2.",
-    }
+    # Check for empty description
+    if not description or not description.strip():
+        return {"label": "unknown", "reasoning": "Description is empty"}
+
+    try:
+        # Step 1: Build the prompt
+        prompt = build_few_shot_prompt(labeled_examples, description)
+
+        # Step 2: Send to the LLM
+        response = _client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=300,
+        )
+        raw_response = response.choices[0].message.content
+
+        # Step 3: Parse the response
+        lines = raw_response.split("\n")
+        label_line = next(line for line in lines if line.startswith("Label:"))
+        reasoning_line = next(line for line in lines if line.startswith("Reasoning:"))
+
+        label = label_line.replace("Label:", "").strip().lower()
+        reasoning = reasoning_line.replace("Reasoning:", "").strip()
+
+        # Step 4: Validate the label
+        if label not in VALID_LABELS:
+            label = "unknown"
+
+        return {"label": label, "reasoning": reasoning}
+
+    except (KeyError, ValueError, IndexError) as e:
+        # Parsing failed
+        print(f"Parse error for description: {description[:50]}... — {str(e)}")
+        return {"label": "unknown", "reasoning": f"Parse error: {str(e)}"}
+
+    except Exception as e:
+        # Network error, API error, etc.
+        print(f"Classifier error for description: {description[:50]}... — {str(e)}")
+        return {"label": "unknown", "reasoning": f"Classifier error: {str(e)}"}

@@ -91,10 +91,21 @@ the format below:" followed by the output format you chose.
 **What output format should you request from the LLM?**
 
 ```
-[blank — you need to parse the response in classify_episode(). What format
-makes parsing reliable? Think about: a single label on its own line?
-A structured format like "Label: X / Reasoning: Y"? JSON?
-What are the tradeoffs?]
+Use a simple structured format:
+
+Label: <label>
+Reasoning: <brief explanation>
+
+Why this format:
+- Easy for the LLM to produce (doesn't require JSON escaping)
+- Trivial to parse with split() and simple string operations
+- Clear, human-readable for debugging
+- Robust: even if formatting is slightly off (extra spaces, etc.),
+  we can extract with startswith() and strip()
+
+Alternative considered — JSON: More structured but overkill here.
+This is two fields, not a complex nested object. JSON adds no value
+and makes parsing more fragile if the LLM adds explanation text.
 ```
 
 ---
@@ -102,8 +113,24 @@ What are the tradeoffs?]
 **Edge cases to handle in the prompt:**
 
 ```
-[blank — what if labeled_examples is empty? What if the description is very
-short? How does your prompt handle these?]
+1. Empty labeled_examples:
+   - Still include the task instruction and label definitions
+   - Add a note: "(No training examples provided; classify based on task
+     instructions above.)"
+   - This becomes a zero-shot attempt, which is less accurate but won't crash
+   - The LLM still has the taxonomy, so it can make a reasonable guess
+
+2. Very short description (e.g., title only):
+   - Format as-is. The taxonomy is clear enough that even one sentence
+     helps the LLM decide
+   - Edge case: blank/null description
+     → Return {"label": "unknown", "reasoning": "Description is empty"}
+     from classify_episode() without calling the LLM
+
+3. Format robustness:
+   - Always include both title and description in the prompt, even if
+     one is very short
+   - This gives the LLM more signal
 ```
 
 ---
@@ -159,9 +186,21 @@ Extract the response text from:
 **Step 3 — Parse the response:**
 
 ```
-[blank — how do you extract the label and reasoning from the LLM's text output?
-What string operations or parsing logic do you need?
-This depends on the output format you chose in build_few_shot_prompt.]
+Given the "Label: X\nReasoning: Y" format, parse as follows:
+
+1. Split response by newlines: lines = response.split('\n')
+2. Find the line starting with "Label:":
+   - label_line = next(line for line in lines if line.startswith('Label:'))
+   - label = label_line.replace('Label:', '').strip().lower()
+3. Find the line starting with "Reasoning:":
+   - reasoning_line = next(line for line in lines if line.startswith('Reasoning:'))
+   - reasoning = reasoning_line.replace('Reasoning:', '').strip()
+
+Why this approach:
+- Handles extra whitespace gracefully (strip() cleans it up)
+- Case-insensitive (lowercase the label before validation)
+- Doesn't assume line order (uses startswith to find each field)
+- Fails explicitly if either field is missing (exception caught in Step 5)
 ```
 
 ---
@@ -169,8 +208,18 @@ This depends on the output format you chose in build_few_shot_prompt.]
 **Step 4 — Validate the label:**
 
 ```
-[blank — what do you do if the LLM returns a label that isn't in VALID_LABELS?
-What should label be set to?]
+if label.lower() not in VALID_LABELS:
+    label = "unknown"
+
+Why "unknown" and not raise an error:
+- The evaluation loop calls this function 20 times
+- One bad response shouldn't crash the entire evaluation
+- "unknown" tells the caller "we tried but couldn't classify confidently"
+- It's a valid return value that downstream code can handle (e.g., exclude
+  from accuracy metrics, log it for debugging)
+
+Debug note: Log which episodes returned "unknown" — if it's more than 1-2,
+your prompt or output format may need tuning.
 ```
 
 ---
@@ -178,9 +227,31 @@ What should label be set to?]
 **Step 5 — Handle errors gracefully:**
 
 ```
-[blank — what could go wrong? (Network error? Unparseable response?)
-What should the function return if something fails?
-Hint: the evaluation loop runs 20 calls — one bad response shouldn't crash everything.]
+Wrap the entire classify_episode logic in a try-except block:
+
+try:
+    prompt = build_few_shot_prompt(labeled_examples, description)
+    # ... send to LLM ...
+    # ... parse response ...
+    # ... validate label ...
+    return {"label": label, "reasoning": reasoning}
+
+except (KeyError, ValueError, IndexError) as e:
+    # Parsing failed (e.g., missing "Label:" line, no label found)
+    return {"label": "unknown", "reasoning": f"Parse error: {str(e)}"}
+
+except Exception as e:
+    # Network error, API error, etc.
+    return {"label": "unknown", "reasoning": f"Classifier error: {str(e)}"}
+
+Why this approach:
+- Catches parsing errors (IndexError, ValueError from next() if line not found)
+- Catches API/network errors without crashing the evaluation loop
+- Always returns a valid dict with "label" and "reasoning"
+- Includes error details in reasoning for debugging
+
+Important: Don't silence errors completely. Log them (print or logging module)
+so you can spot patterns (e.g., "5 episodes failed with 'parse error'").
 ```
 
 ---
